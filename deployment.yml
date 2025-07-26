@@ -1,0 +1,46 @@
+name: Build and Deploy Frontend to EC2 via S3 (Dev)
+
+on:
+  push:
+    branches:
+      - main  
+
+jobs:
+  build-upload-deploy:
+    runs-on: ubuntu-latest
+    environment: dev  
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20.19.0'
+
+      - name: Install Dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build Project
+        run: yarn build
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Upload dist to S3
+        run: aws s3 sync dist/ s3://synqsol-build-bucket/latest-build/ --delete
+
+      - name: Deploy from S3 to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            aws s3 sync s3://synqsol-build-bucket/latest-build/ /var/www/html/ --delete
+            sudo systemctl restart apache2
