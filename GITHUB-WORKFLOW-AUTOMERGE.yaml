@@ -1,0 +1,43 @@
+name: Auto Merge PR After Approval
+
+on:
+  pull_request_review:
+    types:
+      - submitted
+
+jobs:
+  auto_merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Set up Git
+        run: |
+          git config user.email "${{ secrets.GIT_COMMIT_AUTHOR_EMAIL }}"
+          git config user.name "${{ secrets.GIT_COMMIT_AUTHOR_NAME }}"
+
+      - name: Merge PR on Approval
+        if: github.event.review.state == 'approved'
+        run: |
+          git fetch
+          git checkout ${{ github.event.pull_request.base.ref }}
+          git merge --no-ff --no-commit ${{ github.event.pull_request.head.sha }}
+          git commit -m "Merge pull request #${{ github.event.pull_request.number }}"
+
+          git push origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Delete Branch
+        run: |
+
+          git fetch --all
+
+          branch_name="${{ github.event.pull_request.head.ref }}"
+
+          if git rev-parse --verify "refs/remotes/origin/${branch_name}"; then
+            echo "Deleting branch: ${branch_name}"
+            git push origin --delete "${branch_name}"
+          else
+            echo "Branch does not exist, no action needed."
+          fi

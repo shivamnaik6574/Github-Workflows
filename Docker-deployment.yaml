@@ -1,0 +1,65 @@
+name: Build & Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Deploy to EC2 via SSH
+        run: |
+          # Write SSH key to a file
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          # Add EC2 host to known hosts
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+          # SSH into EC2 and deploy
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_HOST }} << 'EOF'
+
+          echo ">> Switching to root"
+          sudo su << 'INNER'
+
+          echo ">> Moving to project directory..."
+          cd /root/idurar-erp-crm
+
+          echo ">> Ensure .env file exists"
+          if [ ! -f .env ]; then
+              echo "Missing .env file! Copying from .env.example..."
+              cp .env.example .env
+          fi
+
+          echo ">> Pulling latest code..."
+          git fetch --all
+          git reset --hard origin/main
+
+          echo ">> Logging into Docker Hub..."
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+          echo ">> Building Docker images..."
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/image-name:latest ./backend
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/image-name:latest ./frontend
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/image-name:latest ./nginx-proxy
+
+          echo ">> Pushing images to Docker Hub..."
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/image-name:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/image-name:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/image-name:latest
+
+          echo ">> Deploying containers safely..."
+          docker compose --env-file .env pull
+          docker compose --env-file .env up -d --build --remove-orphans
+
+          echo ">> Deployment Complete Successfully!"
+
+          INNER
+          EOF
