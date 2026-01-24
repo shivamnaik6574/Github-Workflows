@@ -1,0 +1,58 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout latest code
+        uses: actions/checkout@v3
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_KEY }}
+
+      - name: Deploy to EC2
+        env:
+          REPO_PAT: ${{ secrets.REPO_PAT }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
+            set -e
+            cd /var/www/html
+
+            if [ -d "myapp-backend" ]; then
+              echo " The Directory exists. Pulling latest changes..."
+              cd myapp-backend
+              git config --global --add safe.directory /var/www/html/myapp-backend
+              git remote set-url origin https://shivamnaik6574:${REPO_PAT}@github.com/myapp-develoment/myapp-backend.git
+              sudo git reset --hard
+              sudo git pull origin main
+            else
+              echo "Directory does not exist. Cloning repo..."
+              git clone https://shivamnaik6574:${REPO_PAT}@github.com/myapp-develoment/myapp-backend.git
+              cd myapp-backend
+            fi
+
+            echo "Setting up virtual environment if not exists..."
+            if [ ! -d "env" ]; then
+              python3 -m venv env
+            fi
+
+            source env/bin/activate
+
+            echo "Installing requirements..."
+            # pip install -r requirements/dev.txt #Installed when required
+
+            echo "Stopping running app processes..."
+            sudo pkill -f "uvicorn" || true
+            sudo pkill -f "python3 main.py" || true
+
+            echo "Starting FastAPI app in background"
+            nohup python3 main.py > app.log 2>&1 &
+          EOF
