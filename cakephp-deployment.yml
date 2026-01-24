@@ -1,0 +1,52 @@
+name: Deploy to EC2 (prod)
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PROD_EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.PROD_EC2_SSH_KEY }}
+          port: 22
+          script: |
+            echo " Deploying latest changes from GitHub..."
+
+            cd /var/www/html || exit 1
+
+            # Allow git operations
+            git config --global --add safe.directory /var/www/html
+
+            # Use existing GitHub SSH key stored already on EC2
+            export GIT_SSH_COMMAND="ssh -i ~/.ssh/myapp-github_key -o StrictHostKeyChecking=no"
+
+            echo "📡 Fetching latest code..."
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+
+            echo " Making CakePHP console executable..."
+            chmod +x bin/cake
+
+            echo " Clearing CakePHP cache..."
+            bin/cake cache clear_all
+
+            echo " Reloading Apache..."
+            sudo systemctl reload httpd || sudo systemctl restart httpd
+
+            echo " Deployment Successful!....."
