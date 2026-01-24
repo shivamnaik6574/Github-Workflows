@@ -1,0 +1,43 @@
+name: GitHub Repo Backup to S3
+
+on:
+  schedule:
+    - cron: "30 18 */5 * *"   # Every 5 days at 00:00 IST (18:30 UTC)
+  workflow_dispatch:          # Manual trigger - optional we can diable this
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Create repo snapshot (zip)
+        run: |
+          DATE=$(date +'%Y-%m-%d')
+          SNAPSHOT_FILE="repo-$DATE.zip"
+          git archive --format=zip --output=$SNAPSHOT_FILE HEAD
+          echo "SNAPSHOT_FILE=$SNAPSHOT_FILE" >> $GITHUB_ENV
+
+      - name: Upload snapshot to S3
+        run: |
+          aws s3 cp $SNAPSHOT_FILE s3://myapp-repo-backups/myapp-admin/
+
+      - name: Keep only last 4 backups
+        run: |
+          FILES=$(aws s3 ls s3://myapp-repo-backups/myapp-admin/ | sort | awk '{print $4}')
+          COUNT=$(echo "$FILES" | wc -l)
+          if [ $COUNT -gt 4 ]; then
+            DELETE=$(echo "$FILES" | head -n -4)
+            for f in $DELETE; do
+              aws s3 rm s3://myapp-repo-backups/myapp-admin/$f
+            done
+          fi
