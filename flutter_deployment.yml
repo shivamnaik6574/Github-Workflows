@@ -1,0 +1,61 @@
+name: Build and Deploy Flutter Web App to EC2 via S3 (Dev)
+
+on:
+  push:
+    branches:
+      - production
+
+jobs:
+  build-upload-deploy:
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # Below version is stable and refered from local 
+          flutter-version: '3.24.3'  
+          channel: 'stable'
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Flutter Web (release)
+        run: flutter build web --release
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Upload build files to S3
+        run: |
+          aws s3 sync build/web/ s3://muapp-build-bucket/latest-build-webapp/ --delete \
+            --exclude ".env" \
+            --exclude ".htaccess"
+
+      - name: Deploy from S3 to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "Syncing build files from S3 to /var/www/html/myapp-web-app..."
+            sudo aws s3 sync s3://myapp-build-bucket/latest-build-webapp/ /var/www/html/myapp-web-app \
+              --exact-timestamps \
+              --exclude ".env" \
+              --exclude ".htaccess"
+
+            echo "Fixing permissions..."
+            sudo chown -R ubuntu:ubuntu /var/www/html/myapp-web-app
+            sudo chmod -R 755 /var/www/html/myapp-web-app
+
+            echo "Restarting Apache..."
+            sudo systemctl restart apache2
