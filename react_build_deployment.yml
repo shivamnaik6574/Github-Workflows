@@ -1,0 +1,71 @@
+name: Build and Deploy Frontend to EC2 via S3 (Dev)
+
+on:
+  push:
+    branches:
+     - main
+     
+jobs:
+  build-upload-deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20.19.0'
+
+      - name: Install Dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build Project
+        run: yarn build
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Upload build files to S3
+        run: aws s3 sync dist/ s3://myapp-build-bucket/latest-build/ --delete
+
+      - name: Deploy from S3 to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "Installing AWS CLI if not present..."
+            if ! command -v aws &> /dev/null
+            then
+              echo "Downloading AWS CLI v2..."
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              sudo apt update
+              sudo apt install -y unzip
+              unzip awscliv2.zip
+              sudo ./aws/install
+              rm -rf aws awscliv2.zip
+            fi
+            export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            export AWS_DEFAULT_REGION=ap-south-1
+            
+            echo "Cleaning old files from /var/www/html/myapp-admin..."
+            sudo find /var/www/html/myapp-admin/* ! -name 'logo.png' -delete
+
+            echo "Syncing build files from S3 to /var/www/html/myapp-admin..."
+            aws s3 sync s3://myapp-build-bucket/latest-build/ /var/www/html/myapp-admin
+
+            echo "Fixing permissions..."
+            sudo chown -R ubuntu:ubuntu /var/www/html/myapp-admin
+            sudo chmod -R 755 /var/www/html/myapp-admin
+
+            echo "Restarting Apache2..."
+            sudo systemctl restart apache2
