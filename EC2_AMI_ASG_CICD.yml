@@ -1,0 +1,312 @@
+name: Deploy to AWS ASG with AMI Update
+
+on:
+  push:
+    branches:
+      - main 
+
+env:
+  AWS_REGION: us-east-1  # Change to your region
+  ASG_NAME: my-app-asg  # Change to your ASG name
+  LAUNCH_TEMPLATE_NAME: my-app-launch-template  # Change to your launch template name
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get latest AMI ID from current Launch Template
+        id: get-base-ami
+        run: |
+   
+          BASE_AMI=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters "Name=name,Values=al2023-ami-2023.*-x86_64" \
+            "Name=state,Values=available" \
+            --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+            --output text)
+          
+          
+          echo "base_ami=$BASE_AMI" >> $GITHUB_OUTPUT
+          echo "Base AMI: $BASE_AMI"
+
+      - name: Get current instance details from ASG
+        id: get-instance-details
+        run: |
+          INSTANCE_TYPE=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ env.ASG_NAME }} \
+            --query 'AutoScalingGroups[0].MixedInstancesPolicy.LaunchTemplate.Overrides[0].InstanceType' \
+            --output text 2>/dev/null || echo "t3.micro")
+          
+          if [ "$INSTANCE_TYPE" = "None" ]; then
+            INSTANCE_TYPE=$(aws ec2 describe-launch-template-versions \
+              --launch-template-name ${{ env.LAUNCH_TEMPLATE_NAME }} \
+              --versions '$Latest' \
+              --query 'LaunchTemplateVersions[0].LaunchTemplateData.InstanceType' \
+              --output text)
+          fi
+          
+          echo "instance_type=$INSTANCE_TYPE" >> $GITHUB_OUTPUT
+          echo "Instance Type: $INSTANCE_TYPE"
+
+      - name: Launch temporary EC2 instance for AMI creation
+        id: launch-instance
+        run: |
+          SECURITY_GROUP=$(aws ec2 describe-launch-template-versions \
+            --launch-template-name ${{ env.LAUNCH_TEMPLATE_NAME }} \
+            --versions '$Latest' \
+            --query 'LaunchTemplateVersions[0].LaunchTemplateData.SecurityGroupIds[0]' \
+            --output text)
+          
+          SUBNET=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ env.ASG_NAME }} \
+            --query 'AutoScalingGroups[0].VPCZoneIdentifier' \
+            --output text | cut -d',' -f1)
+          
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ steps.get-base-ami.outputs.base_ami }} \
+            --instance-type ${{ steps.get-instance-details.outputs.instance_type }} \
+            --security-group-ids $SECURITY_GROUP \
+            --subnet-id $SUBNET \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=AMI-Builder-Temp},{Key=Purpose,Value=AMI-Creation}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Launched instance: $INSTANCE_ID"
+          
+          echo "Waiting for instance to be running..."
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          echo "Instance is running"
+
+      - name: Wait for instance to be ready
+        run: |
+          echo "Waiting for instance status checks..."
+          sleep 60  # Additional wait for instance initialization
+
+      - name: Deploy code to temporary instance
+        run: |
+          INSTANCE_ID=${{ steps.launch-instance.outputs.instance_id }}
+          
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          
+          echo "Instance IP: $PUBLIC_IP"
+          
+          aws ssm send-command \
+            --instance-ids $INSTANCE_ID \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "sudo yum update -y",
+              "sudo yum install -y git",
+              "cd /home/ec2-user",
+              "git clone https://github.com/${{ github.repository }}.git app",
+              "cd app",
+              "git checkout ${{ github.sha }}",
+              "# Add your build/install commands here",
+              "# Example for Node.js:",
+              "# curl -fsSL https://rpm.nodesource.com/setup_18.x | sudo bash -",
+              "# sudo yum install -y nodejs",
+              "# npm install",
+              "# npm run build",
+              "# Example for Python:",
+              "# sudo yum install -y python3 python3-pip",
+              "# pip3 install -r requirements.txt"
+            ]' \
+            --output text
+          
+          sleep 30
+          
+      - name: Create AMI from instance
+        id: create-ami
+        run: |
+          INSTANCE_ID=${{ steps.launch-instance.outputs.instance_id }}
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          AMI_NAME="my-app-ami-$TIMESTAMP"
+          
+          echo "Stopping instance..."
+          aws ec2 stop-instances --instance-ids $INSTANCE_ID
+          aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID
+          
+          echo "Creating AMI: $AMI_NAME"
+          AMI_ID=$(aws ec2 create-image \
+            --instance-id $INSTANCE_ID \
+            --name $AMI_NAME \
+            --description "AMI created from GitHub Actions - Commit: ${{ github.sha }}" \
+            --tag-specifications 'ResourceType=image,Tags=[{Key=Name,Value='$AMI_NAME'},{Key=CommitSHA,Value=${{ github.sha }}},{Key=CreatedBy,Value=GitHubActions}]' \
+            --query 'ImageId' \
+            --output text)
+          
+          echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "Created AMI: $AMI_ID"
+          
+          echo "Waiting for AMI to be available..."
+          aws ec2 wait image-available --image-ids $AMI_ID
+          echo "AMI is ready"
+
+      - name: Terminate temporary instance
+        if: always()
+        run: |
+          INSTANCE_ID=${{ steps.launch-instance.outputs.instance_id }}
+          if [ ! -z "$INSTANCE_ID" ]; then
+            echo "Terminating temporary instance: $INSTANCE_ID"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_ID
+          fi
+
+      - name: Create new Launch Template version
+        id: update-lt
+        run: |
+          AMI_ID=${{ steps.create-ami.outputs.ami_id }}
+          
+          echo "Creating new launch template version with AMI: $AMI_ID"
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-name ${{ env.LAUNCH_TEMPLATE_NAME }} \
+            --source-version '$Latest' \
+            --launch-template-data '{"ImageId":"'$AMI_ID'"}' \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+          
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Created launch template version: $NEW_VERSION"
+          
+          aws ec2 modify-launch-template \
+            --launch-template-name ${{ env.LAUNCH_TEMPLATE_NAME }} \
+            --default-version $NEW_VERSION
+          
+          echo "Set version $NEW_VERSION as default"
+
+      - name: Update Auto Scaling Group
+        run: |
+          echo "Updating ASG to use new launch template version..."
+          aws autoscaling update-auto-scaling-group \
+            --auto-scaling-group-name ${{ env.ASG_NAME }} \
+            --launch-template LaunchTemplateName=${{ env.LAUNCH_TEMPLATE_NAME }},Version='$Latest'
+
+      - name: Perform instance refresh (rolling update)
+        id: instance-refresh
+        run: |
+          echo "Starting instance refresh for ASG: ${{ env.ASG_NAME }}"
+          
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ env.ASG_NAME }} \
+            --preferences '{
+              "MinHealthyPercentage": 100,
+              "InstanceWarmup": 300,
+              "CheckpointPercentages": [50, 100],
+              "CheckpointDelay": 300,
+              "SkipMatching": false
+            }' \
+            --query 'InstanceRefreshId' \
+            --output text)
+          
+          echo "refresh_id=$REFRESH_ID" >> $GITHUB_OUTPUT
+          echo "Instance refresh started: $REFRESH_ID"
+          echo "This will maintain minimum 2 healthy instances during the refresh"
+
+      - name: Monitor instance refresh
+        run: |
+          REFRESH_ID=${{ steps.instance-refresh.outputs.refresh_id }}
+          
+          echo "Monitoring instance refresh progress..."
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name ${{ env.ASG_NAME }} \
+              --instance-refresh-ids $REFRESH_ID \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            
+            PERCENTAGE=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name ${{ env.ASG_NAME }} \
+              --instance-refresh-ids $REFRESH_ID \
+              --query 'InstanceRefreshes[0].PercentageComplete' \
+              --output text)
+            
+            echo "Status: $STATUS - Progress: $PERCENTAGE%"
+            
+            if [ "$STATUS" = "Successful" ]; then
+              echo "Instance refresh completed successfully!"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "Instance refresh failed or was cancelled"
+              exit 1
+            fi
+            
+            sleep 30
+          done
+
+      - name: Verify deployment
+        run: |
+          echo "Verifying new instances are running..."
+          
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ env.ASG_NAME }} \
+            --query 'AutoScalingGroups[0].Instances[?HealthStatus==`Healthy`].InstanceId' \
+            --output text)
+          
+          echo "Healthy instances: $INSTANCE_IDS"
+          
+          INSTANCE_COUNT=$(echo $INSTANCE_IDS | wc -w)
+          echo "Number of healthy instances: $INSTANCE_COUNT"
+          
+          if [ $INSTANCE_COUNT -lt 2 ]; then
+            echo "ERROR: Less than 2 healthy instances found!"
+            exit 1
+          fi
+          
+          echo "Deployment verified successfully!"
+
+      - name: Cleanup old AMIs (optional)
+        if: success()
+        run: |
+          echo "Cleaning up old AMIs (keeping last 5)..."
+          
+          OLD_AMIS=$(aws ec2 describe-images \
+            --owners self \
+            --filters "Name=name,Values=my-app-ami-*" \
+            --query 'Images | sort_by(@, &CreationDate) | [:-5].ImageId' \
+            --output text)
+          
+          if [ ! -z "$OLD_AMIS" ]; then
+            for AMI in $OLD_AMIS; do
+              echo "Deregistering old AMI: $AMI"
+              
+              SNAPSHOTS=$(aws ec2 describe-images \
+                --image-ids $AMI \
+                --query 'Images[0].BlockDeviceMappings[*].Ebs.SnapshotId' \
+                --output text)
+              
+              aws ec2 deregister-image --image-id $AMI
+              
+              for SNAPSHOT in $SNAPSHOTS; do
+                if [ ! -z "$SNAPSHOT" ]; then
+                  echo "Deleting snapshot: $SNAPSHOT"
+                  aws ec2 delete-snapshot --snapshot-id $SNAPSHOT || true
+                fi
+              done
+            done
+          else
+            echo "No old AMIs to clean up"
+          fi
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "🎉 Deployment Summary"
+          echo "===================="
+          echo "New AMI created: ${{ steps.create-ami.outputs.ami_id }}"
+          echo "Launch template updated to version: ${{ steps.update-lt.outputs.new_version }}"
+          echo "ASG instance refresh completed"
+          echo "Minimum 2 healthy instances maintained throughout deployment"
+          echo "All instances now running with commit: ${{ github.sha }}"
